@@ -1,0 +1,730 @@
+---
+title: "Projekt"
+nr: 19
+authors: "Student A, Student B"
+output:
+  pdf_document:
+    fig_width: 6
+    fig_height: 4
+  html_document: default
+  word_document: default
+knitr:
+  opts_chunk: 
+    fig.width: 6
+    fig.height: 4
+header-includes:
+  - \usepackage{graphicx}
+  - \usepackage{booktabs}
+  - \usepackage{tabularx}
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+find_best_model <- function(df, response = "Sex", criterion = "AIC") {
+  # Sprawdzenie poprawności parametru criterion
+  if (!criterion %in% c("AIC", "BIC")) {
+    stop("criterion must be either 'AIC' or 'BIC'")
+  }
+
+  # Zmienne objaśniające (bez zmiennej odpowiedzi)
+  predictors <- setdiff(colnames(df), response)
+
+  # Wszystkie kombinacje zmiennych
+  predictor_combinations <- unlist(
+    lapply(1:length(predictors), function(i) combn(predictors, i, simplify = FALSE)),
+    recursive = FALSE
+  )
+
+  # Obliczanie wartości kryterium dla każdego modelu
+  scores <- sapply(predictor_combinations, function(vars) {
+    formula <- as.formula(paste(response, "~", paste(vars, collapse = " + ")))
+    model <- try(glm(formula, family = 'binomial', data = df), silent = TRUE)
+    if (inherits(model, "try-error")) return(Inf)
+    if (criterion == "AIC") {
+      return(AIC(model))
+    } else {
+      return(BIC(model))
+    }
+  })
+
+  # Wybór najlepszego modelu
+  min_index <- which.min(scores)
+  best_vars <- predictor_combinations[[min_index]]
+  best_formula <- as.formula(paste(response, "~", paste(best_vars, collapse = " + ")))
+  best_model <- glm(best_formula, family = 'binomial', data = df)
+
+  return(list(score = scores[min_index], best_model = best_model, best_formula = best_formula))
+}
+
+plot_each_predictor_logistic <- function(model, data, resolution = 600) {
+  predictors <- names(coef(model))[-1]
+  numeric_predictors <- predictors[sapply(data[predictors], is.numeric)]
+  
+  plots <- map(numeric_predictors, function(pred) {
+    # Siatka predyktora
+    x_vals <- seq(min(data[[pred]], na.rm = TRUE),
+                  max(data[[pred]], na.rm = TRUE),
+                  length.out = resolution)
+    
+    base_row <- as.data.frame(lapply(data[predictors], function(col) mean(col, na.rm = TRUE)))
+    new_data <- base_row[rep(1, resolution), ]
+    new_data[[pred]] <- x_vals
+    
+    probs <- predict(model, newdata = new_data, type = "response")
+    
+    prediction_df <- tibble(x = x_vals, Probability = probs)
+    points_df <- tibble(x = data[[pred]], Probability = model$y)
+
+    # Wykres ggplot
+    ggplot(prediction_df, aes(x = x, y = Probability)) +
+      geom_point(data = points_df, aes(x = x, y = Probability), alpha = 0.2, color = "black") +
+      geom_line(color = "blue", size = 1.2) +
+      labs(title = paste("Predykcja względem:", pred),
+           x = pred, y = "Prawdopodobieństwo (y = 1)") +
+      theme_minimal(base_size = 13)
+  })
+  
+  return(invisible(plots))
+}
+compare_models_hl <- function(models, g_values = c(10), alpha = 0.05) {
+  results <- list()
+  model_fit_ok <- logical(length(models))  # wektor TRUE/FALSE
+  
+  model_names <- names(models)
+  if (is.null(model_names)) {
+    model_names <- paste0("model_", seq_along(models))
+  }
+  
+  for (i in seq_along(models)) {
+    model <- models[[i]]
+    model_name <- model_names[i]
+    
+    p_hat <- fitted(model)
+    y <- model$y  # zakładamy, że glm(..., y = TRUE)
+    
+    model_results <- data.frame()
+    
+    for (g in g_values) {
+      hl_test <- tryCatch(
+        hoslem.test(y, p_hat, g = g),
+        error = function(e) NULL
+      )
+      if (!is.null(hl_test)) {
+        model_results <- rbind(model_results, data.frame(
+          model = model_name,
+          g = g,
+          p_value = hl_test$p.value
+        ))
+      }
+    }
+    
+    results[[i]] <- model_results
+    
+    # sprawdzamy, czy WSZYSTKIE p-value są > alpha
+    model_fit_ok[i] <- all(model_results$p_value > alpha)
+  }
+  
+  all_results <- do.call(rbind, results)
+  
+  # najlepszy model dla każdej wartości g
+  best_per_g <- aggregate(p_value ~ g, data = all_results, FUN = max)
+  best_per_g <- merge(best_per_g, all_results, by = c("g", "p_value"))
+  
+  names(model_fit_ok) <- model_names
+  
+  list(
+    all_results = all_results,
+    best_models_by_g = best_per_g,
+    passed_all_pvalues = model_fit_ok  # TRUE/FALSE dla każdego modelu
+  )
+}
+
+
+```
+
+```{r include=FALSE}
+library(tidyverse)
+library(ggcorrplot)
+library(ResourceSelection)
+library(png)
+library(grid)
+```
+
+Hipoteza badawcza $H_b$
+
+Model logistyczny uproszczony (z mniejszą liczbą predyktorów) nie różni się istotnie od modelu logistycznego zawierającego zmienne *Length*,*Diameter*,*Height*,*WholeWeight*,*ShuckedWeight*,*ViseraWeight*,*ShellWeight*,*Rings*.
+
+Zbiór danych zawierający informacje o ślimakach morskich. Zbiór ten składa się z $9$ kolumn i $4176$ wierszy.
+
+\begin{table}[ht]
+\centering
+\begin{tabular}{|l|p{8cm}|l|}
+\hline
+\textbf{Variable Name} & \textbf{Description} & \textbf{Units} \\
+\hline
+Sex & M, F, and I (infant) & -- \\
+Length & Longest shell measurement & mm \\
+Diameter & Perpendicular to length & mm \\
+Height & With meat in shell & mm \\
+Whole\_weight & Whole abalone & grams \\
+Shucked\_weight & Weight of meat & grams \\
+Viscera\_weight & Gut weight (after bleeding) & grams \\
+Shell\_weight & After being dried & grams \\
+Rings & +1.5 gives the age in years & -- \\
+\hline
+\end{tabular}
+\caption{Selected variables from the abalone dataset}
+\end{table}
+
+
+Wczytajmy dane i wyświetlmy podstawowe statystyki.
+
+```{r echo=FALSE}
+df <-  read.csv("abalone.data")
+colnames(df) <- c("Sex", "Length", "Diameter", "Height", 
+                       "WholeWeight", "ShuckedWeight", 
+                       "VisceraWeight", "ShellWeight", "Rings")
+summary(df)
+```
+
+Zmienne *Length*,*Diameter*, *Height*, *WholeWeight*, *ShuckedWeight*, *VisceraWeight*, *ShellWeight*, *Rings*, są zmiennymi ilościowymi. Na podstawie statystyk można zauważyć, że zmienne te różnią się zakresami. Przykładowo zmienne masowe, takie jak WholeWeight i ShellWeight, mają stosunkowo małe wartości minimalne i bardzo szeroki rozstęp międzykwartylowy, co może wskazywać na dużą zmienność w rozmiarach osobników. Może to sugerować konieczność transformacji danych lub dokładniejszej filtracji nietypowych obserwacji przed dopasowaniem modeli.
+
+Oprócz zmiennych ilościowym mam też zmienną kategoryczną *Sex* o $3$ poziomach ("M" - male, "F" - female, "I" - Infant).
+
+Przeprowadźmy teraz eksplorację danych w celu usunięcia obserwacji, które są sprzeczne z oczekiwaniami biologicznymi ślimaków morskich lub wskazują na błędnie wpisane pomiary. Z racji, iż badamy tylko dorosłe osobniki postanawiamy usunąć dzieci bez konkretnie określonej płci.
+
+Stwórzymy poglądowe wykresy w celu znalezienia nieprawidłowości w danych.
+
+```{r include=FALSE}
+df <- df |> filter(Sex!="I")
+```
+
+```{r echo=FALSE}
+ggplot(df ,aes(x=Height,y=Rings,colour = Sex))+
+  geom_point()+
+  geom_smooth(method = 'lm')
+```
+
+Widzimy tutaj $2$ podejrzane obserwacje, dla których zmienna $Height >= 0.4$.
+Obserwacje te uznajemy za odstające, ponieważ mają nietypowo wysoką wartość zmiennej Height.
+
+```{r echo=FALSE}
+ggplot(df ,aes(x=VisceraWeight,y=ShuckedWeight,colour = Sex))+
+  geom_point()+
+  geom_smooth(method = 'lm')
+```
+
+Widzimy tutaj trend liniowy z heteroskedastycznością.
+
+```{r echo=FALSE}
+ggplot(df ,aes(x=ShuckedWeight,y=WholeWeight,colour = Sex))+
+  geom_point()+
+  geom_smooth(method = 'lm')
+```
+
+W powyższym wykresie występuje wyraźny trend liniowy, co wskazauje iż najprawdopodobniej istnieje szansa na zredukowanie ilości paramterów modelu.
+
+```{r echo=FALSE}
+ggplot(df ,aes(x=Diameter,y=Length,colour = Sex))+
+  geom_point()+
+  geom_smooth(method = 'lm')
+```
+
+Widzimy tutaj trend liniowy, co wskazauje iż najprawdopodobniej istnieje szansa na zredukowanie ilości paramterów modelu.
+
+Dokonajmy teraz filtracji danych. Poniższa filtracja ma na celu usunięcie obserwacji z wartościami zerowymi lub niemożliwymi biologicznie. Dodatkowo zastosowano ograniczenia proporcji między zmiennymi, które wynikają z typowych relacji anatomicznych u małży abalone i pozwalają wykluczyć potencjalne błędy pomiarowe.
+
+```{r include=FALSE}
+df <- df |> 
+  filter(
+    Length > 0,
+    Diameter > 0,
+    Height > 0,
+    WholeWeight > 0,
+    ShuckedWeight > 0,
+    VisceraWeight > 0,
+    ShellWeight > 0,
+    Height <= Length,
+    Diameter <= Length,
+    ShuckedWeight <= WholeWeight,
+    VisceraWeight <= ShuckedWeight,
+    ShellWeight <= WholeWeight,
+    Height <= 0.4  * Length,
+    Diameter <= 0.95 * Length, 
+    ShellWeight <= 0.70 * WholeWeight,
+    Rings <= 29
+  )
+```
+ 
+W powyższej filtracji usuneliśmy $7$ obserwacjii.
+
+Sprawdźmy jak zmieniły się powyższe wykresy po usunięciu podejrzanych danych.
+
+```{r echo=FALSE}
+ggplot(df ,aes(x=Height,y=Rings,colour = Sex))+
+  geom_point()+
+  geom_smooth(method = 'lm')
+```
+
+```{r echo=FALSE}
+ggplot(df,aes(x=VisceraWeight,y=ShuckedWeight,colour = Sex))+
+  geom_point()+
+  geom_smooth(method = 'lm')
+```
+
+```{r echo=FALSE}
+ggplot(df  ,aes(x=ShuckedWeight,y=WholeWeight,colour = Sex))+
+  geom_point()+
+  geom_smooth(method = 'lm')
+```
+
+```{r echo=FALSE}
+ggplot(df  ,aes(x=Diameter,y=Length,colour = Sex))+
+  geom_point()+
+  geom_smooth(method = 'lm')
+```
+
+W powyższych wykresach widzimy poprawę i nie widać jakiś błędnych danych.
+
+W trakcie prac, znaleźliśmy jeszcze jedną obserwacje odstającą. Obserwacja ta jest najprawdopodobniej błędna, ponieważ przedstawia nienaturalnie wysoką wagę mięsa *ShuckedWeight* przy bardzo małej wysokości *Height* muszli. W tym przypadku, taka kombinacja cech jest biologicznie nierealna. Decydujemy się usunąć tą obserwację.
+
+```{r echo=FALSE}
+ggplot(df ,aes(x=Height,y=ShuckedWeight,colour = Sex))+
+  geom_point()+
+  geom_smooth(method = 'lm')
+```
+
+```{r include=FALSE}
+df <- df[!(
+  df$Sex == "F" &
+  df$Length == 0.635 &
+  df$Diameter == 0.495 &
+  df$Height == 0.015 &
+  df$WholeWeight == 1.1565 &
+  df$ShuckedWeight == 0.5115 &
+  df$VisceraWeight == 0.308 &
+  df$ShellWeight == 0.2885 &
+  df$Rings == 9
+), ]
+```
+
+Wykres po usunięciu obserwacji odstającej.
+```{r echo=FALSE}
+ggplot(df,aes(x=Height,y=ShellWeight,colour = Sex))+
+  geom_point()+
+  geom_smooth(method = 'lm')
+```
+
+Sprawdźmy histogramy oraz korelacje poszczególnych numerycznych cech.
+
+```{r echo=FALSE}
+ggplot(df, aes(x = Length)) +
+  geom_histogram(fill = "skyblue", color = "white", bins = 30) +
+  theme_minimal() +
+  labs(title = "Histogram Length", x = "Length", y = "Liczba")
+
+ggplot(df, aes(x = Diameter)) +
+  geom_histogram(fill = "tomato", color = "white", bins = 30) +
+  theme_minimal() +
+  labs(title = "Histogram Diameter", x = "Diameter", y = "Liczba")
+
+ggplot(df, aes(x = WholeWeight)) +
+  geom_histogram(fill = "mediumseagreen", color = "white", bins = 30) +
+  theme_minimal() +
+  labs(title = "Histogram WholeWeight", x = "WholeWeight", y = "Liczba")
+
+ggplot(df, aes(x = ShuckedWeight)) +
+  geom_histogram(fill = "orchid", color = "white", bins = 30) +
+  theme_minimal() +
+  labs(title = "Histogram ShuckedWeight", x = "ShuckedWeight", y = "Liczba")
+
+ggplot(df, aes(x = VisceraWeight)) +
+  geom_histogram(fill = "gold", color = "white", bins = 30) +
+  theme_minimal() +
+  labs(title = "Histogram VisceraWeight", x = "VisceraWeight", y = "Liczba")
+
+ggplot(df, aes(x = ShellWeight)) +
+  geom_histogram(fill = "deepskyblue3", color = "white", bins = 30) +
+  theme_minimal() +
+  labs(title = "Histogram ShellWeight", x = "ShellWeight", y = "Liczba")
+
+ggplot(df, aes(x = Rings)) +
+  geom_histogram(fill = "darkorange", color = "white", bins = 30) +
+  theme_minimal() +
+  labs(title = "Histogram Rings", x = "Rings", y = "Liczba")
+
+```
+
+Wykresy nie wyglądają normalnie, można rozważyć przekształcenia zmiennych, jednakże rozkłady te są zbliżone do rozkładu normalnego.
+
+
+```{r echo=FALSE}
+df_numeric <- df |> 
+  select(where(is.numeric))
+
+cor_matrix <- cor(df_numeric, use = "complete.obs")
+
+ggcorrplot(cor_matrix, 
+           lab = TRUE, 
+           type = "lower", 
+           title = "Macierz korelacji (tylko kolumny liczbowe)")
+
+```
+
+Widzimy, że współczynnik korelacji dla naszych zmiennych są dość wysokie. Istnieje duże prawdopodobieństwo, że część naszych zmiennych zostanie zredukowana.
+
+Dopasujmy model regresji logistycznej do naszych danych.
+
+```{r include=FALSE}
+logistic_data <- df
+logistic_data$Sex <- as.factor(logistic_data$Sex)
+```
+
+
+```{r echo=FALSE}
+whole_log_model <- glm(Sex ~ .,family = 'binomial',data = logistic_data)
+summary(whole_log_model)
+```
+
+Wyliczmy ilorazy szans dla naszych współczynników.
+```{r echo=FALSE}
+odds_ratios <- exp(coef(whole_log_model))
+round(odds_ratios, 3)
+```
+Dla modelu regresji logistycznej dopasowanego do zmiennej \texttt{Sex} (gdzie zakładamy kodowanie: \texttt{1 = "M"}, \texttt{0 = "F"}), wartości ilorazu szans \( e^{\beta_j} \) są następujące:
+
+\begin{itemize}
+  \item \textbf{(Intercept)}: \( e^{\beta_0} = 17.907 \) — to wartość ilorazu szans, gdy wszystkie predyktory są równe 0.
+  
+  \item \textbf{Length}: \( e^{\beta_{\text{Length}}} = 0.251 \) — każda jednostka wzrostu długości zmniejsza szansę bycia samcem.
+
+  \item \textbf{Diameter}: \( e^{\beta_{\text{Diameter}}} = 0.006 \) — większa średnica znacznie zmniejsza szansę bycia samcem.
+
+  \item \textbf{Height}: \( e^{\beta_{\text{Height}}} = 0.010 \) — większa wysokość silnie obniża szansę, że ślimak to samiec.
+
+  \item \textbf{WholeWeight}: \( e^{\beta_{\text{WholeWeight}}} = 0.937 \) — niewielki wpływ, nieistotny statystycznie.
+
+  \item \textbf{ShuckedWeight}: \( e^{\beta_{\text{ShuckedWeight}}} = 20.697 \) — większy ciężar po wypatroszeniu znacząco zwiększa szansę, że to samiec.
+
+  \item \textbf{VisceraWeight}: \( e^{\beta_{\text{VisceraWeight}}} = 0.132 \) — większy ciężar wnętrzności znacznie zmniejsza szansę na bycie samcem.
+
+  \item \textbf{ShellWeight}: \( e^{\beta_{\text{ShellWeight}}} = 2.230 \) — większa masa skorupy zwiększa szansę, że to samiec.
+
+  \item \textbf{Rings}: \( e^{\beta_{\text{Rings}}} = 1.000 \) — liczba pierścieni nie ma wpływu na płeć.
+\end{itemize}
+
+```{r echo=FALSE}
+odds <- exp(2.885e+00)
+odds/(1+odds)
+```
+Jeżeli mielibyśmy przypadek ślimaka, który ma parametry równe zero, wtedy na *94,7*% będzie on samcem. (Pamiętajmy, iż w przypadku naszego zbioru danych małe ślimaki były nie identyfikowalne). 
+
+Wykonajmy wykresy diagnostyczne naszego modelu.
+
+```{r echo=FALSE}
+plot(whole_log_model)
+```
+
+Model ten jest dobrze dopasowany ($1$ wykres), na wykresie qqplot można zauważyć lewy cięzki ogon, zatem domyślamy się, że reszty nie są normalne ($2$ wykres). Nie widać heteroskedastyczności, możemy zauważyć, zmiane po prawej stronie. Nie ma żadnych punktów przekraczających odległość Cooka.
+
+Wykonajmy test Hosmer-Lemeshow, który mówi o dopasowaniu regresjii logistycznej.
+```{r echo=FALSE}
+y_numeric <- ifelse(logistic_data$Sex == "M", 1, 0)
+
+hl1 <- hoslem.test(y_numeric, fitted(whole_log_model), g = 10)
+
+hl1
+```
+Z powyżeszego testu otrzymaliśmy, że *p-value* = $0.158$ zatem regresja logistyczna jest dobrze dopasowana do danych. 
+
+Sprawdźmy nasze przypuszczenia dotyczące nienormalności reszt. W tym celu wykonamy test Shapiro-Wilk
+```{r echo=FALSE}
+shapiro.test(resid(whole_log_model))
+```
+Z testu otrzymaliśmy potwierdzenie naszych przypuszczeń dotyczących iż reszty najprawdopodobniej nie są normalne.
+
+Narysujemy teraz zrzutowane wykresy naszego modelu na jeden predyktor wyjaśniający zmienną *Sex*.
+
+```{r echo=FALSE}
+plots <- plot_each_predictor_logistic(whole_log_model, logistic_data)
+for (p in plots) {
+  print(p)
+}
+```
+
+Na podstawie wykresów można zauważyć, że predyktory można podzielić na dwie grupy ze względu na kierunek ich wpływu na prawdopodobieństwo bycia samcem. Część zmiennych wykazuje dodatnią zależność – oznacza to, że wraz ze wzrostem wartości danego predyktora rośnie również prawdopodobieństwo, że osobnik jest samcem. W przypadku pozostałych predyktorów zależność jest odwrotna: wyższe wartości wiążą się ze spadkiem prawdopodobieństwa bycia samcem. Taki podział predyktorów pozwala lepiej zrozumieć, które cechy biologiczne są istotne w rozróżnianiu płci u badanych obiektów oraz w jakim kierunku działają.
+
+Możemy również zaobserwować, że predyktory *Rings*, *WholeWeight* nie wskazują silnej zależności. Podejrzewamy, iż mogą one być nieistotne w predykcji płci ślimaka morskiego. Pokrywa się to również z bardzo wysoką wartością statystki t, uzyskaną z podsumowania modelu.
+
+Przy użyciu naszej funkcji sprawdźmy wszystkie modele zbudowane na naszych zmiennych i kierując się kryteriu AIC, wybierzemy ten dla, którego wynik jest najmniejszy. Samo kryterium AIC mówi nam o dopasowaniu modelu do dancyh z uzględnieniem liczby parametrów modelu. Dlatego aby sprawdzić czy model największy jest najlepszy posłużymy się tym kryterium.
+
+```{r echo=FALSE}
+aic_log_model <- find_best_model(logistic_data,criterion = 'AIC')
+summary(aic_log_model$best_model)
+```
+Wyliczmy ilorazy szans dla naszych współczynników.
+
+```{r echo=FALSE}
+odds_ratios <- exp(coef(aic_log_model$best_model))
+round(odds_ratios, 3)
+```
+
+Dla modelu regresji logistycznej dopasowanego do zmiennej \texttt{Sex} (gdzie zakładamy kodowanie: \texttt{1 = "M"}, \texttt{0 = "F"}), wartości ilorazu szans \( e^{\beta_j} \) są następujące:
+
+\begin{itemize}
+  \item \textbf{(Intercept)}: \( e^{\beta_0} = 13.035 \) — to szansa grupy referencyjnej, gdy wszystkie predyktory są równe 0.
+  
+  \item \textbf{Diameter}: \( e^{\beta_{\text{Diameter}}} = 0.002 \) — wzrost średnicy o 1 jednostkę powoduje, że szansa bycia samcem maleje  około 500 razy.
+
+  \item \textbf{Height}: \( e^{\beta_{\text{Height}}} = 0.026 \) — wzrost wysokości o 1 jednostkę, powoduję, że szansa bycia samcem maleje o około 38 razy.
+
+  \item \textbf{ShuckedWeight}: \( e^{\beta_{\text{ShuckedWeight}}} = 18.634 \) — zwiększenie wagi po wypatroszeniu o jedną jednostkę, powoduje, że szansa bycia samcem rośnie o ponad 18 razy.
+
+  \item \textbf{VisceraWeight}: \( e^{\beta_{\text{VisceraWeight}}} = 0.136 \) — zwiększenie wagi ciała o jedną jednostkę zmiejsza szansę bycia samcem o około 8 krotnie.
+\end{itemize}
+
+Wyniki sugerują, że najistotniejsze zmienne wpływające na płeć to \texttt{Diameter}, \texttt{ShuckedWeight} oraz \texttt{VisceraWeight}.
+
+```{r echo=FALSE}
+odds <- exp(2.5676)
+odds/(1+odds)
+```
+
+Jeżeli mielibyśmy przypadek ślimaka, który ma parametry równe zero, wtedy na *92,8*% będzie on samcem. (Pamiętajmy, iż w przypadku naszego zbioru danych małe ślimaki były nie identyfikowalne). 
+
+Wykonajmy wykresy diagnostyczne naszego modelu.
+
+```{r echo=FALSE}
+plot(aic_log_model$best_model)
+```
+
+Model ten jest dobrze dopasowany ($1$ wykres), na wykresie qqplot można zauważyć lewy cięzki ogon, zatem domyślamy się, że reszty nie są normalne ($2$ wykres). Nie widać heteroskedastyczności, możemy zauważyć, zmiane po prawej stronie. Nie ma żadnych punktów przekraczających odległość Cooka.
+
+Wykonajmy test Hosmer-Lemeshow, który mówi o dopasowaniu regresjii logistycznej
+```{r echo=FALSE}
+y_numeric <- ifelse(logistic_data$Sex == "M", 1, 0)
+
+hl2 <- hoslem.test(y_numeric, fitted(aic_log_model$best_model), g = 10)
+
+hl2
+```
+Z powyżeszego testu otrzymaliśmy, że *p-value* = $0.05472$ zatem regresja logistyczna jest dobrze dopasowana do danych. 
+Zauważmy, że w przypadku pełnego modelu p-value wyszło większe.
+
+Sprawdźmy nasze przypuszczenia dotyczące nienormalności reszt. W tym celu wykonamy test Shapiro-Wilk
+```{r echo=FALSE}
+shapiro.test(resid(aic_log_model$best_model))
+```
+Z testu otrzymaliśmy potwierdzenie naszych przypuszczeń dotyczących iż reszty najprawdopodobniej nie są normalne.
+
+Narysujemy teraz zrzutowane wykresy naszego modelu na jeden predyktor wyjaśniający zmienną *Sex*.
+
+```{r echo=FALSE}
+plots <- plot_each_predictor_logistic(aic_log_model$best_model, logistic_data)
+for (p in plots) {
+  print(p)
+}
+```
+
+Podobnie jak na wykresach w poprzednim modelu, predyktory można podzielić na dwie grupy ze względu na kierunek ich wpływu na prawdopodobieństwo bycia samcem. Część zmiennych wykazuje dodatnią zależność – oznacza to, że wraz ze wzrostem wartości danego predyktora rośnie również prawdopodobieństwo, że osobnik jest samcem. W przypadku pozostałych predyktorów zależność jest odwrotna: wyższe wartości wiążą się ze spadkiem prawdopodobieństwa bycia. 
+
+Zauważmy, że predytkory *WholeWeight*, *Rings*, które spodziewaliśmy się, iż są nieistotne, zostały usunięte poprzez kryternium AIC.
+
+Tym razem zbudujemy model kierując się kryteriu BIC, podobnie jak kryterium AIC porównuje on modele pod względem dopasowania, jednakże kara on mocniej model pod względem większej ilości parametrów, wybierzemy ten dla, którego wynik jest najmniejszy.
+
+```{r echo=FALSE}
+bic_log_model <- find_best_model(logistic_data,criterion = 'BIC')
+summary(bic_log_model$best_model)
+bic_log_model$score
+```
+Wyliczmy ilorazy szans dla naszych współczynników.
+
+```{r echo=FALSE}
+odds_ratios <- exp(coef(bic_log_model$best_model))
+round(odds_ratios, 4)
+```
+
+Dla modelu regresji logistycznej dopasowanego do zmiennej \texttt{Sex} (gdzie zakładamy kodowanie: \texttt{1 = "M"}, \texttt{0 = "F"}), wartości ilorazu szans \( e^{\beta_j} \) są następujące:
+
+\begin{itemize}
+  \item \textbf{(Intercept)}: \( e^{\beta_0} = 15.672 \) — to szansa bycia samcem, gdy wszystkie predyktory są równe 0.
+
+  \item \textbf{Diameter}: \( e^{\beta_{\text{Diameter}}} = 0.0003 \) — wzrost średnicy o jedną jednostkę zmniejsza szansę bycia samcem 3333 krotnie.
+
+  \item \textbf{ShuckedWeight}: \( e^{\beta_{\text{ShuckedWeight}}} = 9.968 \) — wzrost wagi po wypatroszeniu o jedną jednostkę zwiększa szansę bycia samcem około 10 krotnie.
+\end{itemize}
+
+Wyniki sugerują, że najistotniejsze zmienne wpływające na płeć to \texttt{Diameter} oraz \texttt{ShuckedWeight}, obie istotne statystycznie na poziomie \( p < 0.001 \).
+
+```{r echo=FALSE}
+odds <- exp(2.7522)
+odds/(1+odds)
+```
+
+Jeżeli mielibyśmy przypadek ślimaka, który ma parametry równe zero, wtedy na *94*% będzie on samcem. (Pamiętajmy, iż w przypadku naszego zbioru danych małe ślimaki były nie identyfikowalne). 
+
+Wykonajmy wykresy diagnostyczne naszego modelu.
+
+```{r echo=FALSE}
+plot(bic_log_model$best_model)
+```
+
+Model ten jest dobrze dopasowany ($1$ wykres), na wykresie qqplot można zauważyć lewy cięzki ogon, zatem domyślamy się, że reszty nie są normalne ($2$ wykres). Nie widać heteroskedastyczności, możemy zauważyć, zmiane po prawej stronie. Nie ma żadnych punktów przekraczających odległość Cooka.
+
+Wykonajmy test Hosmer-Lemeshow, który mówi o dopasowaniu regresjii logistycznej
+```{r echo=FALSE}
+y_numeric <- ifelse(logistic_data$Sex == "M", 1, 0)
+
+hl3 <- hoslem.test(y_numeric, fitted(bic_log_model$best_model), g = 10)
+
+hl3
+```
+Z powyżeszego testu otrzymaliśmy, że *p-value* = $0.9043$ zatem regresja logistyczna jest dobrze dopasowana do danych. 
+Zauważmy, że w porównaniu do modelu pełnego i tego wybranego za pomocą kryterium AIC otrzymaliśmy znacznie większą wartość p-value.
+
+Sprawdźmy nasze przypuszczenia dotyczące nienormalności reszt. W tym celu wykonamy test Shapiro-Wilk.
+
+```{r echo=FALSE}
+shapiro.test(resid(bic_log_model$best_model))
+```
+Z testu otrzymaliśmy potwierdzenie naszych przypuszczeń dotyczących iż reszty najprawdopodobniej nie są normalne.
+
+```{r echo=FALSE}
+plots <- plot_each_predictor_logistic(bic_log_model$best_model, logistic_data)
+for (p in plots) {
+  print(p)
+}
+```
+
+Kryterium BIC wskazało, że na pewno istotnymi predyktorami są *Diameter* oraz *ShuckedWeight*, w których jeden wpływa dodatnio a drugi ujemnie na prawdopodobieństwo.
+
+Z racji, iż model wybrany za pomocą kryterium BIC, ma tylko $2$ predyktory jesteśmy w stanie wykonać wykresy 3d.
+(Kod generujący te wykresy znajduje się na końcu pliku R Markdown, jeżeli chce Pan zobaczyć wykresy pod innymi kątami).
+
+```{r echo=FALSE}
+file_names <- c("3d_plot_1.png", "3d_plot_2.png", "3d_plot_3.png", "3d_plot_4.png")
+
+for (file in file_names) {
+  img <- readPNG(file)
+  grid.newpage()
+  grid.raster(img, interpolate = TRUE)
+}
+```
+
+Z wykresów można wyczytać, że im większy *ShuckedWeight* i mniejszy *Diameter*, tym większe prawdopodobieństwo przypisania do klasy „M”, a dane rzeczywiste dobrze pokrywają się z prognozowaną powierzchnią decyzyjną modelu.
+
+Podsumowanie
+
+Wykonajmy test anova (czy model mniejszy tak samo dobry jak większy)
+
+```{r echo=FALSE}
+anova(whole_log_model,aic_log_model$best_model)
+```
+Z powyższego testu wynika, że model wybrany przez kryterium AIC jest tak samo dobry jak pełen model. 
+
+```{r echo=FALSE}
+anova(whole_log_model,bic_log_model$best_model)
+```
+Z powyższego testu wynika, że model wybrany przez kryterium BIC jest tak samo dobry jak pełen model. 
+
+
+```{r echo=FALSE}
+anova(aic_log_model$best_model,bic_log_model$best_model)
+```
+Z powyższego testu wynika, że model wybrany przez kryterium BIC nie jest tak samo dobry jak ten wybrany poprzez kryterium AIC. Spodziewalibyśmy byśmy się, że model wybrany przez kryterium BIC jest tak samo dobry jak ten wybrany poprzez kryterium AIC, gdyż oba te modele są tak samo dobre jak model pełny. Co niestety w naszym przypadku nie zachodzi. Wynika z tego, że najprawdopodobniej model wybrany za pomocą kryterium BIC usunął istotną zmienną.
+
+Wykonamy teraz *396* testów dla każdego modelu, gdzie $g \in \{5, 400\}$ w celu znalezienia najlepszego modelu pod względem dopasowania.
+
+```{r echo=FALSE}
+models <- list(
+  AIC_model = aic_log_model$best_model,
+  BIC_model = bic_log_model$best_model,
+  Whole_model = whole_log_model
+)
+
+result <- compare_models_hl(models, g_values = 5:400)
+
+cat("\nIle razy dany model okazał się lepiej dopasowany (najwyższe p-value dla danego g):\n")
+sorted_best <- result$best_models_by_g[order(result$best_models_by_g$g), ]
+print(table(sorted_best$model))
+print(result$passed_all_pvalues)  
+```
+Modelem z nawiększym i  najczęściej występującym p-value jest model wybrany za pomocą kryterium BIC.
+
+Spośród analizowanych modeli tylko model wybrany na podstawie kryterium BIC przeszedł pomyślnie test Hosmera-Lemeshowa dla wszystkich wartości liczby grup. Oznacza to, że w żadnym przypadku nie było podstaw do odrzucenia hipotezy o dobrym dopasowaniu tego modelu. Pozostałe modele (AIC oraz pełny model) przynajmniej w jednej konfiguracji liczby grup nie spełniły warunku istotności statystycznej, co sugeruje możliwe niedopasowanie w niektórych przypadkach.
+
+Zatem model BIC wyróżnia się nie tylko największą liczbą przypadków z najwyższym p-value, ale także spójnym dopasowaniem niezależnie od liczby podziałów danych — co dodatkowo przemawia na jego korzyść.
+
+```{r echo=FALSE}
+Hosmer_Lemeshow_number <- as.data.frame(table(sorted_best$model))$Freq
+
+# Oblicz AIC i BIC
+aic_full <- AIC(whole_log_model)
+bic_full <- BIC(whole_log_model)
+
+aic_aic <- AIC(aic_log_model$best_model)
+bic_aic <- BIC(aic_log_model$best_model)
+
+aic_bic <- AIC(bic_log_model$best_model)
+bic_bic <- BIC(bic_log_model$best_model)
+
+# Tworzymy ramkę danych
+model_comparison <- data.frame(
+  Model = c("Model AIC", "Model BIC", "Pełny model"),
+  AIC = c(aic_aic, aic_bic, aic_full),
+  BIC = c(bic_aic, bic_bic, bic_full),
+  Hosmer_Lemeshow_number = Hosmer_Lemeshow_number
+)
+
+# Zaokrąglenie dla estetyki
+model_comparison$AIC <- round(model_comparison$AIC, 2)
+model_comparison$BIC <- round(model_comparison$BIC, 2)
+
+# Wyświetlenie
+print(model_comparison)
+```
+
+Według testu ANOVA najlepszym modelem jest model AIC, natomiast test Hosmera-Lemeshowa wskazuje na model BIC jako ten, który najlepiej dopasowuje się do danych (największa liczba przypadków z najwyższym p-value). Tylko model BIC przeszedł test Hosmera-Lemeshowa pomyślnie dla wszystkich liczby grup, co oznacza brak istotnych dowodów na jego niedopasowanie niezależnie od podziału danych. Pozostałe modele — pełny i AIC — w niektórych przypadkach wykazały istotne odstępstwa, co może świadczyć o lokalnym niedopasowaniu. W związku z tym odrzucamy hipotezę badawczą, że model pełny jest najlepszy — zarówno test ANOVA, jak i Hosmer-Lemeshow wskazują inne, uproszczone modele jako korzystniejsze, przy czym model BIC okazuje się najstabilniejszy.
+
+
+
+```{r eval=FALSE, include=FALSE}
+library(plotly)
+
+# Siatka do prognoz
+diam_seq <- seq(min(logistic_data$Diameter), max(logistic_data$Diameter), length.out = 50)
+shuck_seq <- seq(min(logistic_data$ShuckedWeight), max(logistic_data$ShuckedWeight), length.out = 50)
+grid <- expand.grid(Diameter = diam_seq, ShuckedWeight = shuck_seq)
+grid$prob <- predict(bic_log_model$best_model, newdata = grid, type = "response")
+z_matrix <- matrix(grid$prob, nrow = length(diam_seq), byrow = TRUE)
+
+# Przygotowanie punktów danych
+data_points <- logistic_data
+data_points$Sex_binary <- ifelse(data_points$Sex == "M", 1, 0)
+
+# Wykres z powierzchnią + punktami danych
+plot_ly() %>%
+  add_surface(x = diam_seq, y = shuck_seq, z = z_matrix, opacity = 0.7, showscale = FALSE) %>%
+  add_markers(
+    data = data_points,
+    x = ~Diameter,
+    y = ~ShuckedWeight,
+    z = ~Sex_binary,
+    color = ~Sex,
+    colors = c("blue", "red"),
+    marker = list(size = 3),
+    name = "Dane rzeczywiste"
+  ) %>%
+  layout(scene = list(
+    xaxis = list(title = "Diameter"),
+    yaxis = list(title = "ShuckedWeight"),
+    zaxis = list(title = "P(Sex = 'M') lub klasa")
+  ))
+```
+
